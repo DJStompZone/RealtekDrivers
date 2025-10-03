@@ -3,25 +3,41 @@
     Downloads a Realtek driver bundle ZIP, extracts it, and installs the contained drivers with pnputil.
 
 .DESCRIPTION
-    This script automates Realtek driver installation end-to-end
+    This script automates Realtek driver installation end-to-end:
+      1) Ensures elevation (UAC admin).
+      2) Downloads a ZIP (e.g., GitHub release asset).
+      3) Optionally verifies SHA256.
+      4) Extracts to a deterministic directory and detects the true root.
+      5) Installs drivers via pnputil using a known list of INF paths or a recursive scan.
 
 .PARAMETER ZipUrl
-    The HTTPS URL of the driver ZIP to download.
+    HTTPS URL of the driver ZIP to download. Defaults to your repo ZIP.
 
 .PARAMETER DestDir
-    Directory to download/extract into. Defaults to a new folder under $env:TEMP named RealtekDrivers_<timestamp>.
+    Directory to download/extract into. Defaults to $env:TEMP\RealtekDrivers_<timestamp>.
 
 .PARAMETER Sha256
-    Optional expected SHA256 checksum of the ZIP. If provided, the file will be verified before extraction.
+    Optional expected SHA256 checksum (64 hex chars). If provided, the ZIP is verified before extraction.
 
 .PARAMETER KeepArchive
-    If specified, the downloaded ZIP is kept after extraction. By default, it is removed on success.
+    Keep the downloaded ZIP after extraction. By default it is removed on success.
+
+.PARAMETER ScanAllInfs
+    If set, recursively scan under the detected root for all *.inf files and attempt to install each with pnputil.
+    When used, /subdirs is implied unnecessary since we feed pnputil concrete file paths.
+
+.PARAMETER PnPUtilExtra
+    Optional extra arguments to pass through to pnputil for each install (e.g., '/reboot'). Do not include /add-driver or /install here.
 
 .PARAMETER WhatIf
-    Shows what would happen if the command runs. No files are modified and no drivers are installed.
+    Shows what would happen without changing anything (respects SupportsShouldProcess).
 
 .EXAMPLE
-    PS> .\Install-RealtekDrivers.ps1 -ZipUrl "https://example.com/RealtekDrivers.zip" -Verbose
+    PS> .\Install-RealtekDrivers.ps1 -Verbose
+    Uses default ZipUrl, extracts, and installs the known INF set.
+
+.EXAMPLE
+    PS> .\Install-RealtekDrivers.ps1 -ZipUrl "https://github.com/DJStompZone/RealtekDrivers/raw/refs/heads/main/RealtekDrivers.zip" -Sha256 "4e99478a6a2a0e6abb93f5316d7b8503e7ebe6607c5e3e733079f204b3b36610" -ScanAllInfs -Verbose
 
 .NOTES
     Author: DJ Stomp <85457381+DJStompZone@users.noreply.github.com>
@@ -30,10 +46,11 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
+[OutputType([int])]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $False)]
     [ValidateNotNullOrEmpty()]
-    [string]$ZipUrl,
+    [string]$ZipUrl = "https://github.com/DJStompZone/RealtekDrivers/raw/refs/heads/main/RealtekDrivers.zip",
 
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
@@ -41,35 +58,39 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]
-    [string]$Sha256,
+    [string]$Sha256 = "4e99478a6a2a0e6abb93f5316d7b8503e7ebe6607c5e3e733079f204b3b36610",
 
-    [switch]$KeepArchive
+    [switch]$KeepArchive,
+
+    [switch]$ScanAllInfs,
+
+    [Parameter(Mandatory = $false)]
+    [string]$PnPUtilExtra
 )
+
+# Nudge old WMF into modern TLS so Invoke-WebRequest doesn't throw a tantrum.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 function Assert-Admin {
     <#
     .SYNOPSIS
         Ensures the script is running elevated; relaunches with RunAs if not.
     #>
-    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($current)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = [Security.Principal.WindowsPrincipal]::new($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         Write-Verbose "Elevation required; relaunching as Administrator."
-        $psi = @{
-            FilePath   = (Get-Process -Id $PID).Path
-            Verb       = 'RunAs'
-            ArgumentList = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', ('"{0}"' -f $MyInvocation.MyCommand.Definition),
-                '-ZipUrl', ('"{0}"' -f $ZipUrl)
-            ) + ($(if ($DestDir) { @('-DestDir', ('"{0}"' -f $DestDir)) } else { @() })) + ($(if ($Sha256) { @('-Sha256', $Sha256) } else { @() })) + ($(if ($KeepArchive) { @('-KeepArchive') } else { @() })) + ($(if ($PSBoundParameters['Verbose']) { @('-Verbose') } else { @() })) + ($(if ($WhatIfPreference) { @('-WhatIf') } else { @() }))
-        }
-        try {
-            Start-Process @psi | Out-Null
-        } catch {
-            throw "Failed to relaunch elevated: $_"
-        }
+        $pwsh = (Get-Process -Id $PID).Path
+        $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $MyInvocation.MyCommand.Definition, '-ZipUrl', $ZipUrl)
+        if ($DestDir)      { $args += @('-DestDir', $DestDir) }
+        if ($Sha256)       { $args += @('-Sha256', $Sha256) }
+        if ($KeepArchive)  { $args += @('-KeepArchive') }
+        if ($ScanAllInfs)  { $args += @('-ScanAllInfs') }
+        if ($PnPUtilExtra) { $args += @('-PnPUtilExtra', $PnPUtilExtra) }
+        if ($PSBoundParameters['Verbose']) { $args += @('-Verbose') }
+        if ($WhatIfPreference) { $args += @('-WhatIf') }
+        $psi = @{ FilePath = $pwsh; Verb = 'RunAs'; ArgumentList = $args }
+        try { Start-Process @psi | Out-Null } catch { throw "Failed to relaunch elevated: $_" }
         exit 0
     }
 }
@@ -90,9 +111,9 @@ function Invoke-RetryDownload {
         $attempt++
         try {
             Write-Verbose "Downloading ($attempt/$MaxAttempts): $Url -> $OutFile"
-            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -Headers @{ 'User-Agent' = 'Realtek-Installer/1.0' }
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers @{ 'User-Agent' = 'Realtek-Installer/1.0' }
             if (-not (Test-Path $OutFile)) { throw "Download did not produce a file." }
-            if ((Get-Item $OutFile).Length -lt 1024) { Write-Warning "Downloaded file is suspiciously small."; }
+            if ((Get-Item $OutFile).Length -lt 1024) { Write-Warning "Downloaded file is suspiciously small." }
             return Get-Item $OutFile
         } catch {
             if ($attempt -ge $MaxAttempts) { throw "Download failed after $MaxAttempts attempts: $_" }
@@ -113,9 +134,7 @@ function Test-FileSha256 {
         [Parameter(Mandatory = $true)][string]$Expected
     )
     $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-    if ($actual -ne $Expected) {
-        throw "Checksum mismatch for $Path. Expected $Expected but got $actual."
-    }
+    if ($actual -ne $Expected) { throw "Checksum mismatch for $Path. Expected $Expected but got $actual." }
     Write-Verbose "Checksum OK: $actual"
 }
 
@@ -143,12 +162,12 @@ function Get-UnzippedRoot {
     .SYNOPSIS
         Figures out the actual content root inside the extracted directory.
     .DESCRIPTION
-        GitHub release ZIPs typically create a single top-level folder like Repo-1.2.3. If there is exactly one child directory and no files at the top level, we treat that child as the real root.
+        If there is exactly one child directory and no top-level files, treat that as root (typical GitHub zip layout).
     #>
     param([Parameter(Mandatory = $true)][string]$ExtractDir)
-    $topFiles = Get-ChildItem -LiteralPath $ExtractDir -Force
-    $dirs = $topFiles | Where-Object { $_.PSIsContainer }
-    $files = $topFiles | Where-Object { -not $_.PSIsContainer }
+    $top = Get-ChildItem -LiteralPath $ExtractDir -Force
+    $dirs  = $top | Where-Object { $_.PSIsContainer }
+    $files = $top | Where-Object { -not $_.PSIsContainer }
     if ($dirs.Count -eq 1 -and $files.Count -eq 0) {
         Write-Verbose "Detected single-folder root: $($dirs[0].FullName)"
         return $dirs[0].FullName
@@ -159,7 +178,7 @@ function Get-UnzippedRoot {
 function Get-DriverInfPaths {
     <#
     .SYNOPSIS
-        Returns the list of expected driver INF paths under a given root.
+        Returns the list of expected driver INF paths under a given root (static list).
     #>
     param([Parameter(Mandatory = $true)][string]$Root)
     $rel = @(
@@ -174,30 +193,52 @@ function Get-DriverInfPaths {
     return $rel | ForEach-Object { Join-Path $Root $_ }
 }
 
+function Get-InfPathsRecursive {
+    <#
+    .SYNOPSIS
+        Recursively finds all *.inf files under a given root.
+    .DESCRIPTION
+        Filters out common non-driver crumbs like 'autorun.inf' at the root; otherwise returns all INFs.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $all = Get-ChildItem -LiteralPath $Root -Recurse -Include *.inf -ErrorAction SilentlyContinue
+    # Basic filter: skip root-level autorun.inf type files
+    $filtered = $all | Where-Object { $_.Name -notmatch '^(autorun|setup)\.inf$' }
+    return $filtered.FullName
+}
+
 function Install-Drivers {
     <#
     .SYNOPSIS
         Installs a set of INF files using pnputil.
     #>
-    param([Parameter(Mandatory = $true)][string[]]$InfPaths)
+    param(
+        [Parameter(Mandatory = $true)][string[]]$InfPaths,
+        [string]$ExtraArgs
+    )
     $installed = 0
     foreach ($path in $InfPaths) {
         if (-not (Test-Path -LiteralPath $path)) {
             Write-Warning "Missing INF (skipping): $path"
             continue
         }
-        $msg = "pnputil /add-driver `"$path`" /install"
+        $argList = @('/add-driver', $path, '/install')
+        if ($ExtraArgs) {
+            # split on whitespace but keep quoted groups
+            $argList += [System.Management.Automation.PSParser]::Tokenize($ExtraArgs, [ref]$null) | Where-Object { $_.Type -eq 'String' } | ForEach-Object { $_.Content }
+        }
+        $pretty = 'pnputil ' + ($argList | ForEach-Object { if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ } }) -join ' '
         if ($PSCmdlet.ShouldProcess($path, "Install driver via pnputil")) {
             try {
-                Write-Verbose $msg
-                $out = & pnputil /add-driver "$path" /install 2>&1
+                Write-Verbose $pretty
+                $out = & pnputil @argList 2>&1
                 $installed++
                 $out | Write-Output
             } catch {
                 Write-Warning "Install failed: $path : $_"
             }
         } else {
-            Write-Host "[WhatIf] Would install: $path"
+            Write-Host "[WhatIf] Would install: $pretty"
         }
     }
     return $installed
@@ -245,10 +286,20 @@ try {
     $Root = Get-UnzippedRoot -ExtractDir $ExtractDir
     Write-Verbose "Content root: $Root"
 
-    $infPaths = Get-DriverInfPaths -Root $Root
+    $infPaths = if ($ScanAllInfs) {
+        Write-Verbose "Scanning recursively for *.inf under $Root"
+        Get-InfPathsRecursive -Root $Root
+    } else {
+        Get-DriverInfPaths -Root $Root
+    }
+
+    if (-not $infPaths -or $infPaths.Count -eq 0) {
+        throw "No INF files were found to install. Check the ZIP layout or use -ScanAllInfs."
+    }
+
     Write-Verbose ("Will process these INFs:`n" + ($infPaths -join "`n"))
 
-    $count = Install-Drivers -InfPaths $infPaths
+    $count = Install-Drivers -InfPaths $infPaths -ExtraArgs $PnPUtilExtra
     Write-Host "Driver install attempts (existing files only): $count"
 
     if (-not $KeepArchive -and (Test-Path $ZipPath)) {
@@ -260,7 +311,9 @@ try {
         }
     }
 
-    Write-Host "Done. If some INFs were missing, check the ZIP layout or update the INF list."
+    Write-Host "Done. If some INFs were skipped or failed, check the ZIP and pnputil output above."
+    # Return a non-negative integer (attempt count) as exit code for CI scripting ergonomics.
+    exit ([int][Math]::Max(0, $count))
 } catch {
     Write-Error $_
     exit 1
