@@ -172,7 +172,7 @@ function Get-UnzippedRoot {
         Write-Verbose "Detected single-folder root: $($dirs[0].FullName)"
         return $dirs[0].FullName
     }
-    return $ExtractDir
+    return "$ExtractDir\Realtek"
 }
 
 function Get-DriverInfPaths {
